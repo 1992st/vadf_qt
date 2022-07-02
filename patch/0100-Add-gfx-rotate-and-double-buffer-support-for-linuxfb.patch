@@ -1,0 +1,1259 @@
+diff --git a/src/plugins/platforms/linuxfb/linuxfb.pro b/src/plugins/platforms/linuxfb/linuxfb.pro
+index d3a4476..3198a77 100644
+--- a/src/plugins/platforms/linuxfb/linuxfb.pro
++++ b/src/plugins/platforms/linuxfb/linuxfb.pro
+@@ -12,10 +12,12 @@ qtHaveModule(input_support-private): \
+ 
+ SOURCES = main.cpp \
+           qlinuxfbintegration.cpp \
+-          qlinuxfbscreen.cpp
++          qlinuxfbscreen.cpp \
++          ssgfx.c
+ 
+ HEADERS = qlinuxfbintegration.h \
+-          qlinuxfbscreen.h
++          qlinuxfbscreen.h \
++          ssgfx.h
+ 
+ qtHaveModule(kms_support-private) {
+     QT += kms_support-private
+diff --git a/src/plugins/platforms/linuxfb/qlinuxfbscreen.cpp b/src/plugins/platforms/linuxfb/qlinuxfbscreen.cpp
+index cb8962d..79c60af 100644
+--- a/src/plugins/platforms/linuxfb/qlinuxfbscreen.cpp
++++ b/src/plugins/platforms/linuxfb/qlinuxfbscreen.cpp
+@@ -38,6 +38,7 @@
+ ****************************************************************************/
+ 
+ #include "qlinuxfbscreen.h"
++#include "ssgfx.h"
+ #include <QtFbSupport/private/qfbcursor_p.h>
+ #include <QtFbSupport/private/qfbwindow_p.h>
+ #include <QtCore/QFile>
+@@ -61,8 +62,6 @@
+ #include <limits.h>
+ #include <signal.h>
+ 
+-#include <linux/fb.h>
+-
+ QT_BEGIN_NAMESPACE
+ 
+ static int openFramebufferDevice(const QString &dev)
+@@ -287,23 +286,22 @@ static void blankScreen(int fd, bool on)
+ }
+ 
+ QLinuxFbScreen::QLinuxFbScreen(const QStringList &args)
+-    : mArgs(args), mFbFd(-1), mTtyFd(-1), mBlitter(0)
++    : mArgs(args), mFbFd(-1), mTtyFd(-1), mRotation(0)
+ {
+-    mMmap.data = 0;
++    SS_MI_Init();
+ }
+ 
+ QLinuxFbScreen::~QLinuxFbScreen()
+ {
+     if (mFbFd != -1) {
+-        if (mMmap.data)
+-            munmap(mMmap.data - mMmap.offset, mMmap.size);
++        SS_SYS_FreeMIAddr(&mMIAddr);
+         close(mFbFd);
+     }
+ 
++    SS_MI_Exit();
++
+     if (mTtyFd != -1)
+         resetTty(mTtyFd, mOldTtyMode);
+-
+-    delete mBlitter;
+ }
+ 
+ bool QLinuxFbScreen::initialize()
+@@ -313,6 +311,7 @@ bool QLinuxFbScreen::initialize()
+     QRegularExpression mmSizeRx(QLatin1String("mmsize=(\\d+)x(\\d+)"));
+     QRegularExpression sizeRx(QLatin1String("size=(\\d+)x(\\d+)"));
+     QRegularExpression offsetRx(QLatin1String("offset=(\\d+)x(\\d+)"));
++    QRegularExpression rotationRx(QLatin1String("rotation=(0|90|180|270)"));
+ 
+     QString fbDevice, ttyDevice;
+     QSize userMmSize;
+@@ -334,6 +333,8 @@ bool QLinuxFbScreen::initialize()
+             ttyDevice = match.captured(1);
+         else if (arg.contains(fbRx, &match))
+             fbDevice = match.captured(1);
++        else if (arg.contains(rotationRx, &match))
++            mRotation = match.captured(1).toInt();
+     }
+ 
+     if (fbDevice.isEmpty()) {
+@@ -355,40 +356,42 @@ bool QLinuxFbScreen::initialize()
+ 
+     // Read the fixed and variable screen information
+     fb_fix_screeninfo finfo;
+-    fb_var_screeninfo vinfo;
+-    memset(&vinfo, 0, sizeof(vinfo));
+     memset(&finfo, 0, sizeof(finfo));
++    memset(&mVinfo, 0, sizeof(mVinfo));
+ 
+     if (ioctl(mFbFd, FBIOGET_FSCREENINFO, &finfo) != 0) {
+         qErrnoWarning(errno, "Error reading fixed information");
+         return false;
+     }
+ 
+-    if (ioctl(mFbFd, FBIOGET_VSCREENINFO, &vinfo)) {
++    if (ioctl(mFbFd, FBIOGET_VSCREENINFO, &mVinfo)) {
+         qErrnoWarning(errno, "Error reading variable information");
+         return false;
+     }
+ 
+-    mDepth = determineDepth(vinfo);
+-    mBytesPerLine = finfo.line_length;
+-    QRect geometry = determineGeometry(vinfo, userGeometry);
+-    mGeometry = QRect(QPoint(0, 0), geometry.size());
+-    mFormat = determineFormat(vinfo, mDepth);
+-    mPhysicalSize = determinePhysicalSize(vinfo, userMmSize, geometry.size());
+-
+-    // mmap the framebuffer
+-    mMmap.size = finfo.smem_len;
+-    uchar *data = (unsigned char *)mmap(0, mMmap.size, PROT_READ | PROT_WRITE, MAP_SHARED, mFbFd, 0);
+-    if ((long)data == -1) {
+-        qErrnoWarning(errno, "Failed to mmap framebuffer");
+-        return false;
+-    }
++    mScreenSize = mVinfo.xres * mVinfo.yres * mVinfo.bits_per_pixel / 8;
+ 
+-    mMmap.offset = geometry.y() * mBytesPerLine + geometry.x() * mDepth / 8;
+-    mMmap.data = data + mMmap.offset;
++    mBufferNumber = finfo.smem_len / mScreenSize;
++    mBufferIndex = 0;
++
++    mDepth = determineDepth(mVinfo);
++    QRect geometry = determineGeometry(mVinfo, userGeometry);
++    QRect originalGeometry = geometry;
++    if(mRotation == 90 || mRotation == 270) {
++        int tmp = geometry.x();
++        geometry.setX(geometry.y());
++        geometry.setY(tmp);
++
++        tmp = geometry.width();
++        geometry.setWidth(geometry.height());
++        geometry.setHeight(tmp);
++    }
++    mBytesPerLine = geometry.width() * mDepth / 8;
++    mGeometry = QRect(QPoint(0, 0), geometry.size());
++    mFormat = determineFormat(mVinfo, mDepth);
++    mPhysicalSize = determinePhysicalSize(mVinfo, userMmSize, originalGeometry.size());
+ 
+     QFbScreen::initializeCompositor();
+-    mFbScreenImage = QImage(mMmap.data, geometry.width(), geometry.height(), mBytesPerLine, mFormat);
+ 
+     mCursor = new QFbCursor(this);
+ 
+@@ -399,6 +402,29 @@ bool QLinuxFbScreen::initialize()
+     switchToGraphicsMode(mTtyFd, doSwitchToGraphicsMode, &mOldTtyMode);
+     blankScreen(mFbFd, false);
+ 
++    mFbPhyAddr = (MI_PHY) finfo.smem_start;
++
++    SS_SYS_GetMIAddr(mScreenSize * 2, &mMIAddr);
++
++    mSrcSurface.eGFXcolorFmt = E_MI_GFX_FMT_ARGB8888;
++    mSrcSurface.phy_addr = mMIAddr.phy;
++    mSrcSurface.w = geometry.width();
++    mSrcSurface.h = geometry.height();
++    mSrcSurface.pitch = geometry.width() * (mDepth / 8);
++    mSrcSurface.BytesPerPixel = mDepth / 8;
++
++    mDstSurface.eGFXcolorFmt = E_MI_GFX_FMT_ARGB8888;
++    mDstSurface.phy_addr = mMIAddr.phy + mScreenSize;
++    mDstSurface.w = originalGeometry.width();
++    mDstSurface.h = originalGeometry.height();
++    mDstSurface.pitch = originalGeometry.width() * (mDepth / 8);
++    mDstSurface.BytesPerPixel = mDepth / 8;
++
++    optRect.left = 0;
++    optRect.top = 0;
++    optRect.right = mSrcSurface.w;
++    optRect.bottom = mSrcSurface.h;
++
+     return true;
+ }
+ 
+@@ -409,12 +435,51 @@ QRegion QLinuxFbScreen::doRedraw()
+     if (touched.isEmpty())
+         return touched;
+ 
+-    if (!mBlitter)
+-        mBlitter = new QPainter(&mFbScreenImage);
++    // Update source rect
++    for (const QRect &rect : touched) {
++        int nLine = rect.height();
++        int copyOffset = rect.left() * (mDepth / 8) + mBytesPerLine * rect.top();
++        int copyBytes = rect.width() * (mDepth / 8);
++
++        uchar *dst = ((uchar *) mMIAddr.pVa) + copyOffset;
++        uchar *src = mScreenImage.bits() + copyOffset;
++        for (int i = 0;  i < nLine; i++) {
++            memcpy(dst, src, copyBytes);
++            dst += mBytesPerLine;
++            src += mBytesPerLine;
++        }
++    }
+ 
+-    mBlitter->setCompositionMode(QPainter::CompositionMode_Source);
+-    for (const QRect &rect : touched)
+-        mBlitter->drawImage(rect, mScreenImage, rect);
++    // GFX Rotate
++    switch (mRotation)
++    {
++    case 90:
++        SS_GFX_BitBlit_CW(&mSrcSurface, &mDstSurface, &optRect);
++        break;
++    case 180:
++        SS_GFX_BitBlit_HVFlip(&mSrcSurface, &mDstSurface, &optRect);
++        break;
++    case 270:
++        SS_GFX_BitBlit_CCW(&mSrcSurface, &mDstSurface, &optRect);
++        break;
++    default:
++        SS_GFX_BitBlit_Normal(&mSrcSurface, &mDstSurface, &optRect);
++        break;
++    }
++
++    if (mBufferNumber > 1) {
++        // Update frame buffer
++        MI_PHY fbPhyAddr = mFbPhyAddr + (mBufferIndex * mScreenSize);
++        SS_SYS_MemcpyPa(fbPhyAddr, mDstSurface.phy_addr, mScreenSize);
++
++        // Swap frame buffer
++        mVinfo.yoffset = mBufferIndex * mVinfo.yres;
++        ioctl(mFbFd, FBIOPAN_DISPLAY, &mVinfo);
++        mBufferIndex = !mBufferIndex;
++    } else {
++        // Update frame buffer
++        SS_SYS_MemcpyPa(mFbPhyAddr, mDstSurface.phy_addr, mScreenSize);
++    }
+ 
+     return touched;
+ }
+@@ -423,25 +488,11 @@ QRegion QLinuxFbScreen::doRedraw()
+ // In linuxfb's case it will also include the mouse cursor.
+ QPixmap QLinuxFbScreen::grabWindow(WId wid, int x, int y, int width, int height) const
+ {
+-    if (!wid) {
+-        if (width < 0)
+-            width = mFbScreenImage.width() - x;
+-        if (height < 0)
+-            height = mFbScreenImage.height() - y;
+-        return QPixmap::fromImage(mFbScreenImage).copy(x, y, width, height);
+-    }
+-
+-    QFbWindow *window = windowForId(wid);
+-    if (window) {
+-        const QRect geom = window->geometry();
+-        if (width < 0)
+-            width = geom.width() - x;
+-        if (height < 0)
+-            height = geom.height() - y;
+-        QRect rect(geom.topLeft() + QPoint(x, y), QSize(width, height));
+-        rect &= window->geometry();
+-        return QPixmap::fromImage(mFbScreenImage).copy(rect);
+-    }
++    Q_UNUSED(wid);
++    Q_UNUSED(x);
++    Q_UNUSED(y);
++    Q_UNUSED(width);
++    Q_UNUSED(height);
+ 
+     return QPixmap();
+ }
+diff --git a/src/plugins/platforms/linuxfb/qlinuxfbscreen.h b/src/plugins/platforms/linuxfb/qlinuxfbscreen.h
+index c7ce455..ff1a66d 100644
+--- a/src/plugins/platforms/linuxfb/qlinuxfbscreen.h
++++ b/src/plugins/platforms/linuxfb/qlinuxfbscreen.h
+@@ -41,6 +41,8 @@
+ #define QLINUXFBSCREEN_H
+ 
+ #include <QtFbSupport/private/qfbscreen_p.h>
++#include <linux/fb.h>
++#include "ssgfx.h"
+ 
+ QT_BEGIN_NAMESPACE
+ 
+@@ -64,17 +66,22 @@ private:
+     QStringList mArgs;
+     int mFbFd;
+     int mTtyFd;
++    int mRotation;
+ 
+     QImage mFbScreenImage;
+     int mBytesPerLine;
+     int mOldTtyMode;
+ 
+-    struct {
+-        uchar *data;
+-        int offset, size;
+-    } mMmap;
++    int mScreenSize;
++    int mBufferNumber;
++    int mBufferIndex;
++    fb_var_screeninfo mVinfo;
+ 
+-    QPainter *mBlitter;
++    MI_PHY mFbPhyAddr;
++    st_MI_ADDR mMIAddr;
++    Surface mSrcSurface;
++    Surface mDstSurface;
++    RECT optRect;
+ };
+ 
+ QT_END_NAMESPACE
+diff --git a/src/plugins/platforms/linuxfb/ssgfx.c b/src/plugins/platforms/linuxfb/ssgfx.c
+new file mode 100644
+index 0000000..e3afd46
+--- /dev/null
++++ b/src/plugins/platforms/linuxfb/ssgfx.c
+@@ -0,0 +1,587 @@
++#include "ssgfx.h"
++
++static struct
++{
++    void *hnd;
++    MI_S32 (*MI_SYS_Init)(void);
++    MI_S32 (*MI_SYS_Exit)(void);
++    MI_S32 (*MI_SYS_MemsetPa)(MI_PHY phyPa, MI_U32 u32Val, MI_U32 u32Lenth);
++    MI_S32 (*MI_SYS_MemcpyPa)(MI_PHY phyDst, MI_PHY phySrc, MI_U32 u32Lenth);
++    MI_S32 (*MI_SYS_MMA_Alloc)(MI_U8 *pstMMAHeapName, MI_U32 u32BlkSize, MI_PHY *phyAddr);
++    MI_S32 (*MI_SYS_MMA_Free)(MI_PHY phyAddr);
++    MI_S32 (*MI_SYS_Mmap)(MI_U64 phyAddr, MI_U32 u32Size, void **ppVirtualAddress, MI_BOOL bCache);
++    MI_S32 (*MI_SYS_Munmap)(void *pVirtualAddress, MI_U32 u32Size);
++    MI_S32 (*MI_SYS_FlushInvCache)(void *pVirtualAddress, MI_U32 u32Length);
++} g_stSysHnd;
++
++static struct
++{
++    void *hnd;
++    MI_S32 (*MI_GFX_Open)(void);
++    MI_S32 (*MI_GFX_Close)(void);
++    MI_S32 (*MI_GFX_WaitAllDone)(MI_BOOL bWaitAllDone, MI_U16 u16TargetFence);
++    MI_S32 (*MI_GFX_QuickFill)(MI_GFX_Surface_t *pstDst, MI_GFX_Rect_t *pstDstRect,
++        MI_U32 u32ColorVal, MI_U16 *pu16Fence);
++    MI_S32 (*MI_GFX_DrawLine)(MI_GFX_Surface_t *pstDst, MI_GFX_Line_t *pstLine, MI_U16 *pu16Fence);
++    MI_S32 (*MI_GFX_BitBlit)(MI_GFX_Surface_t *pstSrc, MI_GFX_Rect_t *pstSrcRect,
++        MI_GFX_Surface_t *pstDst,  MI_GFX_Rect_t *pstDstRect, MI_GFX_Opt_t *pstOpt, MI_U16 *pu16Fence);
++    MI_S32 (*MI_GFX_SetPalette)(MI_GFX_ColorFmt_e eColorFmt, MI_GFX_Palette_t* pstPalette);
++    MI_S32 (*MI_GFX_CreateDev)(MI_GFX_DevAttr_t *pstDevAttr);
++    MI_S32 (*MI_GFX_DestroyDev)(void);
++} g_stGfxHnd;
++
++static int __MI_LIB_Load()
++{
++    int ret = -1, flags = 0;
++
++    flags = RTLD_NOW | RTLD_GLOBAL;
++    DLOPEN(g_stSysHnd, "libmi_sys.so", flags, ret);
++    DLOPEN(g_stGfxHnd, "libmi_gfx.so", flags, ret);
++
++    return 0;
++}
++
++static int __MI_SYS_Resolve()
++{
++    int ret = -1;
++
++    DLSYM(g_stSysHnd, MI_SYS_Init, ret);
++    DLSYM(g_stSysHnd, MI_SYS_Exit, ret);
++    DLSYM(g_stSysHnd, MI_SYS_MemsetPa, ret);
++    DLSYM(g_stSysHnd, MI_SYS_MemcpyPa, ret);
++    DLSYM(g_stSysHnd, MI_SYS_MMA_Alloc, ret);
++    DLSYM(g_stSysHnd, MI_SYS_MMA_Free, ret);
++    DLSYM(g_stSysHnd, MI_SYS_Mmap, ret);
++    DLSYM(g_stSysHnd, MI_SYS_Munmap, ret);
++    DLSYM(g_stSysHnd, MI_SYS_FlushInvCache, ret);
++
++    return 0;
++}
++
++static int __MI_GFX_Resolve()
++{
++    int ret = -1;
++
++    DLSYM(g_stGfxHnd, MI_GFX_Open, ret);
++    DLSYM(g_stGfxHnd, MI_GFX_Close, ret);
++    DLSYM(g_stGfxHnd, MI_GFX_WaitAllDone, ret);
++    DLSYM(g_stGfxHnd, MI_GFX_QuickFill, ret);
++    DLSYM(g_stGfxHnd, MI_GFX_DrawLine, ret);
++    DLSYM(g_stGfxHnd, MI_GFX_BitBlit, ret);
++    DLSYM(g_stGfxHnd, MI_GFX_SetPalette, ret);
++
++    return 0;
++}
++
++MI_S32 SS_MI_Init(void)
++{
++    if(0 != __MI_LIB_Load())
++    {
++        printf("__MI_LIB_Load fail\n");
++        return -1;
++    }
++    if(0 != __MI_SYS_Resolve() || 0 != __MI_GFX_Resolve())
++    {
++        printf("__MI_SYS_Resolve or __MI_GFX_Resolve resolve fail\n");
++        return -1;
++    }
++    g_stSysHnd.MI_SYS_Init();
++    g_stGfxHnd.MI_GFX_Open();
++    return MI_SUCCESS;
++}
++
++MI_S32 SS_MI_Exit(void)
++{
++    g_stGfxHnd.MI_GFX_Close();
++    g_stSysHnd.MI_SYS_Exit();
++    return MI_SUCCESS;
++}
++
++static void *_SS_SYS_MemAlloc(size_t size, MI_PHY *phyAddr)
++{
++    MI_S32 ret = -1;
++    MI_PHY phy;
++    void *pVa = NULL;
++
++    ret = g_stSysHnd.MI_SYS_MMA_Alloc(NULL, size, &phy);
++    if(MI_SUCCESS != ret)
++    {
++        printf("MI_SYS_MMA_Alloc fail!\n");
++        return NULL;
++    }
++    if(MI_SUCCESS != g_stSysHnd.MI_SYS_Mmap(phy, size, &pVa, false))
++    {
++        printf("MI_SYS_Mmap fail!\n");
++        g_stSysHnd.MI_SYS_MMA_Free(phy);
++        return NULL;
++    }
++    if(NULL != phyAddr)
++    {
++        *phyAddr = phy;
++    }
++
++    return pVa;
++}
++
++void SS_SYS_MemcpyPa(MI_PHY phyDst, MI_PHY phySrc, MI_U32 u32Lenth)
++{
++    g_stSysHnd.MI_SYS_MemcpyPa(phyDst, phySrc, u32Lenth);
++}
++
++void *SS_SYS_GetMIAddr(size_t size, st_MI_ADDR *miAddr)
++{
++    if(0 == size || NULL == miAddr)
++        return NULL;
++
++    miAddr->len = size;
++    miAddr->pVa = _SS_SYS_MemAlloc(size, &miAddr->phy);
++
++    return miAddr->pVa;
++}
++
++static void _SS_SYS_Free(void *pVa, MI_PHY phy, size_t size)
++{
++    if(NULL == pVa || 0 == size)
++        return;
++
++    g_stSysHnd.MI_SYS_Munmap(pVa, size);
++    g_stSysHnd.MI_SYS_MMA_Free(phy);
++}
++
++void SS_SYS_FreeMIAddr(st_MI_ADDR *miAddr)
++{
++    _SS_SYS_Free(miAddr->pVa, miAddr->phy, miAddr->len);
++}
++
++MI_S32 SS_GFX_BitBlit(MI_GFX_Surface_t *pstSrc, MI_GFX_Rect_t *pstSrcRect,
++                            MI_GFX_Surface_t *pstDst, MI_GFX_Rect_t *pstDstRect,
++                            MI_GFX_Opt_t *pstOpt, MI_U16 *pu16Fence)
++{
++    if(MI_SUCCESS != g_stGfxHnd.MI_GFX_BitBlit(pstSrc, pstSrcRect, pstDst, pstDstRect, pstOpt, pu16Fence))
++    {
++        printf("MI_GFX_BitBlit fail!\n");
++        return -1;
++    }
++
++    return 0;
++}
++
++MI_S32 SS_GFX_WaitAllDone(MI_BOOL bWaitAllDone, MI_U16 u16TargetFence)
++{
++    return g_stGfxHnd.MI_GFX_WaitAllDone(bWaitAllDone, u16TargetFence);
++}
++
++static void _extractSquareClip_MinArea(RECT src, RECT **clipA, int *clipN)
++{
++    int clipNum = 0;
++    RECT *clip = NULL;
++    int i = 0;
++    unsigned char last_try = (RECTW(src) * RECTH(src)) < 128 * 128 ? 1 : 0;
++    if (RECTW(src) > RECTH(src))
++    {
++        clipNum = (RECTW(src) + RECTH(src) - 1) / RECTH(src);
++        *clipA = calloc(sizeof(RECT), clipNum);
++        clip = *clipA;
++
++        for (; i < clipNum - 1; i++)
++        {
++            clip[i].top = src.top;
++            clip[i].bottom = src.bottom;
++            clip[i].left = src.left + RECTH(src) * i;
++            clip[i].right = clip[i].left + RECTH(src);
++        }
++        if (last_try)
++        {
++            clip[i].top = src.top;
++            clip[i].bottom = src.bottom;
++            clip[i].left = src.right - RECTH(src);
++            clip[i].right = src.right;
++        }
++    }
++    else if (RECTW(src) < RECTH(src))
++    {
++        clipNum = (RECTH(src) + RECTW(src) - 1) / RECTW(src);
++        *clipA = calloc(sizeof(RECT), clipNum);
++        clip = *clipA;
++
++        for (; i < clipNum - 1; i++)
++        {
++            clip[i].left = src.left;
++            clip[i].right = src.right;
++            clip[i].top = src.top + RECTW(src) * i;
++            clip[i].bottom = clip[i].top + RECTW(src);
++        }
++
++        if (last_try)
++        {
++            clip[i].left = src.left;
++            clip[i].right = src.right;
++            clip[i].top = src.bottom - RECTW(src);
++            clip[i].bottom = src.bottom;
++        }
++    }
++    else
++    {
++        clipNum = 1;
++        *clipA = calloc(sizeof(RECT), clipNum);
++        clip = *clipA;
++        memcpy(clip, &src, sizeof(RECT));
++        *clipN = clipNum;
++        return;
++    }
++    if (!last_try)
++    {
++        RECT src0;
++        RECT *srcClip0 = NULL;
++        int clipnum0;
++        if (RECTW(src) > RECTH(src))
++        {
++            src0.top = src.top;
++            src0.bottom = src.bottom;
++            src0.left = clip[i - 1].right;
++            src0.right = src.right;
++        }
++        else
++        {
++            src0.top = clip[i - 1].bottom;
++            src0.bottom = src.bottom;
++            src0.left = src.left;
++            src0.right = src.right;
++        }
++        _extractSquareClip_MinArea(src0, &srcClip0, &clipnum0);
++        clip = calloc(sizeof(RECT), clipNum - 1 + clipnum0);
++        memcpy(clip, *clipA, (clipNum - 1) * sizeof(RECT));
++        memcpy(clip + clipNum - 1, srcClip0, clipnum0 * sizeof(RECT));
++        free(srcClip0);
++        free(*clipA);
++        *clipA = clip;
++        *clipN = clipNum + clipnum0 - 1;
++        return;
++    }
++    *clipN = clipNum;
++}
++
++static void _get_dst_rect_cw(RECT *dst_rect, const RECT *src_rect, Surface *pDstSurface)
++{
++    dst_rect->left = pDstSurface->w - src_rect->bottom;
++    dst_rect->top = src_rect->left;
++    dst_rect->right = pDstSurface->w - src_rect->top;
++    dst_rect->bottom = src_rect->right;
++}
++
++static void _get_src_rect_cw(const RECT *dst_rect, RECT *src_rect, Surface *pDstSurface)
++{
++    src_rect->left = dst_rect->top;
++    src_rect->top = pDstSurface->w - dst_rect->right;
++    src_rect->right = dst_rect->bottom;
++    src_rect->bottom = pDstSurface->w - dst_rect->left;
++}
++
++static void _get_dst_rect_ccw(RECT *dst_rect, const RECT *src_rect, Surface *pDstSurface)
++{
++    dst_rect->left = src_rect->top;
++    dst_rect->bottom = pDstSurface->h - src_rect->left;
++    dst_rect->right = src_rect->bottom;
++    dst_rect->top = pDstSurface->h - src_rect->right;
++}
++
++static void _get_src_rect_ccw(const RECT *dst_rect, RECT *src_rect, Surface *pDstSurface)
++{
++    src_rect->left = pDstSurface->h - dst_rect->bottom;
++    src_rect->top = dst_rect->left;
++    src_rect->right = pDstSurface->h - dst_rect->top;
++    src_rect->bottom = dst_rect->right;
++}
++
++static void _get_dst_rect_hvflip(RECT *dst_rect, const RECT *src_rect, Surface *pDstSurface)
++{
++    dst_rect->left = pDstSurface->w - src_rect->right;
++    dst_rect->bottom = pDstSurface->h - src_rect->top;
++    dst_rect->right = pDstSurface->w - src_rect->left;
++    dst_rect->top = pDstSurface->h - src_rect->bottom;
++}
++
++/*
++static void _get_src_rect_hvflip(const RECT *dst_rect, RECT *src_rect, Surface *pDstSurface)
++{
++    src_rect->left = pDstSurface->w - dst_rect->right;
++    src_rect->top = pDstSurface->h - dst_rect->bottom;
++    src_rect->right = pDstSurface->w - dst_rect->left;
++    src_rect->bottom = pDstSurface->h - dst_rect->top;
++}
++*/
++
++void SS_GFX_BitBlit_CW(Surface *pSrcSurface, Surface *pDstSurface, RECT *pRect)
++{
++    RECT src_update = *(RECT *)pRect;
++    RECT dst_update;
++    int dst_width, dst_height;
++    int i;
++    MI_U16 u16Fence;
++
++    _get_dst_rect_cw(&dst_update, &src_update, pDstSurface);
++
++    dst_width = RECTW(dst_update);
++    dst_height = RECTH(dst_update);
++
++    if (dst_width <= 0 || dst_height <= 0)
++        return;
++
++    _get_src_rect_cw(&dst_update, &src_update, pDstSurface);
++
++    int srcClipN = 0;
++    RECT *srcClip = NULL, *dstClip = NULL;
++    _extractSquareClip_MinArea(src_update, &srcClip, &srcClipN);
++    dstClip = calloc(sizeof(RECT), srcClipN);
++    for (int i = 0; i < srcClipN; i++)
++    {
++        _get_dst_rect_cw(&dstClip[i], &srcClip[i], pDstSurface);
++    }
++
++    for (i = 0; i < srcClipN; i++)
++    {
++        MI_GFX_Surface_t stSrc;
++        MI_GFX_Rect_t stSrcRect;
++        MI_GFX_Surface_t stDst;
++        MI_GFX_Rect_t stDstRect;
++        MI_GFX_Opt_t stOpt;
++
++        memset(&stOpt, 0, sizeof(stOpt));
++        stDst.phyAddr = pDstSurface->phy_addr;
++        stDst.eColorFmt = pDstSurface->eGFXcolorFmt;
++        stDst.u32Width = pDstSurface->w;
++        stDst.u32Height = pDstSurface->h;
++        stDst.u32Stride = pDstSurface->pitch;
++
++        stDstRect.s32Xpos = dstClip[i].left;
++        stDstRect.s32Ypos = dstClip[i].top;
++        stDstRect.u32Width = RECTW(dstClip[i]);
++        stDstRect.u32Height = RECTH(dstClip[i]);
++
++        stSrc.phyAddr = pSrcSurface->phy_addr;
++        stSrc.eColorFmt = pSrcSurface->eGFXcolorFmt;
++
++        stSrc.u32Width = pSrcSurface->w;
++        stSrc.u32Height = pSrcSurface->h;
++        stSrc.u32Stride = pSrcSurface->pitch;
++
++        stSrcRect.s32Xpos = srcClip[i].left;
++        stSrcRect.s32Ypos = srcClip[i].top;
++        stSrcRect.u32Width = RECTW(srcClip[i]);
++        stSrcRect.u32Height = RECTH(srcClip[i]);
++
++        stOpt.stClipRect.s32Xpos = stDstRect.s32Xpos;
++        stOpt.stClipRect.s32Ypos = stDstRect.s32Ypos;
++        stOpt.stClipRect.u32Width = stDstRect.u32Width;
++        stOpt.stClipRect.u32Height = stDstRect.u32Height;
++
++        stOpt.u32GlobalSrcConstColor = 0xFF000000;
++        stOpt.u32GlobalDstConstColor = 0xFF000000;
++        stOpt.eSrcDfbBldOp = E_MI_GFX_DFB_BLD_ONE;
++        stOpt.eDstDfbBldOp = E_MI_GFX_DFB_BLD_ZERO;
++        stOpt.eMirror = E_MI_GFX_MIRROR_NONE;
++        stOpt.eRotate = E_MI_GFX_ROTATE_90;
++
++        SS_GFX_BitBlit(&stSrc, &stSrcRect, &stDst, &stDstRect, &stOpt, &u16Fence);
++    }
++
++    SS_GFX_WaitAllDone(0, u16Fence);
++    free(srcClip);
++    free(dstClip);
++}
++
++void SS_GFX_BitBlit_CCW(Surface *pSrcSurface, Surface *pDstSurface, RECT *pRect)
++{
++    RECT src_update = *pRect;
++    RECT dst_update;
++    int dst_width, dst_height;
++    int i;
++    MI_U16 u16Fence;
++
++    _get_dst_rect_ccw(&dst_update, &src_update, pDstSurface);
++
++    dst_width = RECTW(dst_update);
++    dst_height = RECTH(dst_update);
++
++    if (dst_width <= 0 || dst_height <= 0)
++        return;
++
++    _get_src_rect_ccw(&dst_update, &src_update, pDstSurface);
++
++    int srcClipN = 0;
++    RECT *srcClip = NULL, *dstClip = NULL;
++    _extractSquareClip_MinArea(src_update, &srcClip, &srcClipN);
++    dstClip = calloc(sizeof(RECT), srcClipN);
++
++    for (int i = 0; i < srcClipN; i++)
++    {
++        _get_dst_rect_ccw(&dstClip[i], &srcClip[i], pDstSurface);
++    }
++
++    for (i = 0; i < srcClipN; i++)
++    {
++        MI_GFX_Surface_t stSrc;
++        MI_GFX_Rect_t stSrcRect;
++        MI_GFX_Surface_t stDst;
++        MI_GFX_Rect_t stDstRect;
++        MI_GFX_Opt_t stOpt;
++
++        memset(&stOpt, 0, sizeof(stOpt));
++        stDst.phyAddr = pDstSurface->phy_addr;
++        stDst.eColorFmt = pDstSurface->eGFXcolorFmt;
++        stDst.u32Width = pDstSurface->w;
++        stDst.u32Height = pDstSurface->h;
++        stDst.u32Stride = pDstSurface->pitch;
++
++        stDstRect.s32Xpos = dstClip[i].left;
++        stDstRect.s32Ypos = dstClip[i].top;
++        stDstRect.u32Width = RECTW(dstClip[i]);
++        stDstRect.u32Height = RECTH(dstClip[i]);
++
++        stSrc.phyAddr = pSrcSurface->phy_addr;
++        stSrc.eColorFmt = pSrcSurface->eGFXcolorFmt;
++
++        stSrc.u32Width = pSrcSurface->w;
++        stSrc.u32Height = pSrcSurface->h;
++        stSrc.u32Stride = pSrcSurface->pitch;
++
++        stSrcRect.s32Xpos = srcClip[i].left;
++        stSrcRect.s32Ypos = srcClip[i].top;
++        stSrcRect.u32Width = RECTW(srcClip[i]);
++        stSrcRect.u32Height = RECTH(srcClip[i]);
++
++        stOpt.stClipRect.s32Xpos = stDstRect.s32Xpos;
++        stOpt.stClipRect.s32Ypos = stDstRect.s32Ypos;
++        stOpt.stClipRect.u32Width = stDstRect.u32Width;
++        stOpt.stClipRect.u32Height = stDstRect.u32Height;
++
++        stOpt.u32GlobalSrcConstColor = 0xFF000000;
++        stOpt.u32GlobalDstConstColor = 0xFF000000;
++        stOpt.eSrcDfbBldOp = E_MI_GFX_DFB_BLD_ONE;
++        stOpt.eDstDfbBldOp = E_MI_GFX_DFB_BLD_ZERO;
++        stOpt.eMirror = E_MI_GFX_MIRROR_NONE;
++        stOpt.eRotate = E_MI_GFX_ROTATE_270;
++
++        SS_GFX_BitBlit(&stSrc, &stSrcRect, &stDst, &stDstRect, &stOpt, &u16Fence);
++    }
++
++    SS_GFX_WaitAllDone(0, u16Fence);
++    free(srcClip);
++    free(dstClip);
++}
++
++void SS_GFX_BitBlit_HVFlip(Surface *pSrcSurface, Surface *pDstSurface, RECT *pRect)
++{
++    RECT dstClip;
++    _get_dst_rect_hvflip(&dstClip,pRect,pSrcSurface);
++    MI_GFX_Surface_t stSrc;
++    MI_GFX_Rect_t stSrcRect;
++    MI_GFX_Surface_t stDst;
++    MI_GFX_Rect_t stDstRect;
++    MI_GFX_Opt_t stOpt;
++    MI_U16 u16Fence;
++
++    memset(&stOpt, 0, sizeof(stOpt));
++    stDst.phyAddr = pDstSurface->phy_addr;
++    stDst.eColorFmt = pDstSurface->eGFXcolorFmt;
++    stDst.u32Width = pDstSurface->w;
++    stDst.u32Height = pDstSurface->h;
++    stDst.u32Stride = pDstSurface->pitch;
++
++    stDstRect.s32Xpos = dstClip.left;
++    stDstRect.s32Ypos = dstClip.top;
++    stDstRect.u32Width = RECTW(dstClip);
++    stDstRect.u32Height = RECTH(dstClip);
++
++    stSrc.phyAddr = pSrcSurface->phy_addr;
++    stSrc.eColorFmt = pSrcSurface->eGFXcolorFmt;
++
++    stSrc.u32Width = pSrcSurface->w;
++    stSrc.u32Height = pSrcSurface->h;
++    stSrc.u32Stride = pSrcSurface->pitch;
++
++    stSrcRect.s32Xpos = pRect->left;
++    stSrcRect.s32Ypos = pRect->top;
++    stSrcRect.u32Width = RECTW(dstClip);
++    stSrcRect.u32Height = RECTH(dstClip);
++
++    stOpt.stClipRect.s32Xpos = stDstRect.s32Xpos;
++    stOpt.stClipRect.s32Ypos = stDstRect.s32Ypos;
++    stOpt.stClipRect.u32Width = stDstRect.u32Width;
++    stOpt.stClipRect.u32Height = stDstRect.u32Height;
++
++    stOpt.u32GlobalSrcConstColor = 0xFF000000;
++    stOpt.u32GlobalDstConstColor = 0xFF000000;
++    stOpt.eSrcDfbBldOp = E_MI_GFX_DFB_BLD_ONE;
++    stOpt.eDstDfbBldOp = E_MI_GFX_DFB_BLD_ZERO;
++    stOpt.eMirror = E_MI_GFX_MIRROR_NONE;
++    stOpt.eRotate = E_MI_GFX_ROTATE_180;
++
++    SS_GFX_BitBlit(&stSrc, &stSrcRect, &stDst, &stDstRect, &stOpt, &u16Fence);
++    SS_GFX_WaitAllDone(0, u16Fence);
++}
++
++void SS_GFX_BitBlit_Normal(Surface *pSrcSurface, Surface *pDstSurface, RECT *pRect)
++{
++    RECT src_update;
++    int width, height;
++
++    src_update.left = pRect->left;
++    src_update.right = pRect->right;
++    src_update.top = pRect->top;
++    src_update.bottom = pRect->bottom;
++
++    width = RECTW(src_update);
++    height = RECTH(src_update);
++
++    if (width <= 0 || height <= 0)
++    {
++        return;
++    }
++
++    MI_GFX_Surface_t stSrc;
++    MI_GFX_Rect_t stSrcRect;
++    MI_GFX_Surface_t stDst;
++    MI_GFX_Rect_t stDstRect;
++    MI_GFX_Opt_t stOpt;
++    MI_U16 u16Fence;
++
++    memset(&stOpt, 0, sizeof(stOpt));
++    stDst.phyAddr = pDstSurface->phy_addr;
++    stDst.eColorFmt = pDstSurface->eGFXcolorFmt;
++    stDst.u32Width = pDstSurface->w;
++    stDst.u32Height = pDstSurface->h;
++    stDst.u32Stride = pDstSurface->pitch;
++
++    stDstRect.s32Xpos = src_update.left;
++    stDstRect.s32Ypos = src_update.top;
++    stDstRect.u32Width = width;
++    stDstRect.u32Height = height;
++
++    stSrc.phyAddr = pSrcSurface->phy_addr;
++    stSrc.eColorFmt = pSrcSurface->eGFXcolorFmt;
++
++    stSrc.u32Width = pSrcSurface->w;
++    stSrc.u32Height = pSrcSurface->h;
++    stSrc.u32Stride = pSrcSurface->pitch;
++
++    stSrcRect.s32Xpos = src_update.left;
++    stSrcRect.s32Ypos = src_update.top;
++    stSrcRect.u32Width = width;
++    stSrcRect.u32Height = height;
++
++    stOpt.stClipRect.s32Xpos = stDstRect.s32Xpos;
++    stOpt.stClipRect.s32Ypos = stDstRect.s32Ypos;
++    stOpt.stClipRect.u32Width = stDstRect.u32Width;
++    stOpt.stClipRect.u32Height = stDstRect.u32Height;
++
++    stOpt.u32GlobalSrcConstColor = 0xFF000000;
++    stOpt.u32GlobalDstConstColor = 0xFF000000;
++    stOpt.eSrcDfbBldOp = E_MI_GFX_DFB_BLD_ONE;
++    stOpt.eDstDfbBldOp = E_MI_GFX_DFB_BLD_ZERO;
++    stOpt.eMirror = E_MI_GFX_MIRROR_NONE;
++    stOpt.eRotate = E_MI_GFX_ROTATE_0;
++
++    SS_GFX_BitBlit(&stSrc, &stSrcRect, &stDst, &stDstRect, &stOpt, &u16Fence);
++    SS_GFX_WaitAllDone(0, u16Fence);
++}
+diff --git a/src/plugins/platforms/linuxfb/ssgfx.h b/src/plugins/platforms/linuxfb/ssgfx.h
+new file mode 100644
+index 0000000..ec00cb0
+--- /dev/null
++++ b/src/plugins/platforms/linuxfb/ssgfx.h
+@@ -0,0 +1,352 @@
++#ifndef __SSGFX_H__
++#define __SSGFX_H__
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <dlfcn.h>
++#include <string.h>
++#include <errno.h>
++#include <stdbool.h>
++#include <stddef.h>
++
++//=============================================================================
++// MACROS
++//=============================================================================
++
++#define DLOPEN(lib, name, attr, ret) \
++    do \
++    { \
++        if(NULL == (lib.hnd = dlopen(name, attr))) \
++        { \
++            printf("Open library %s fail, %s(%d)\n", name, strerror(errno), errno); \
++            return ret; \
++        } \
++    }while(0);
++
++#define DLSYM(lib, sym, ret) \
++    do \
++    { \
++        if(NULL == (lib.sym = (typeof(lib.sym))dlsym(lib.hnd, #sym))) \
++        { \
++            printf("Get symbol %s fail, %s(%d)\n", #sym, strerror(errno), errno); \
++            return ret; \
++        } \
++    }while(0);
++
++//=============================================================================
++// System Data Type
++//=============================================================================
++
++#define MI_SUCCESS 0
++
++/// data type unsigned char, data length 1 byte
++typedef unsigned char MI_U8; // 1 byte
++/// data type unsigned short, data length 2 byte
++typedef unsigned short MI_U16; // 2 bytes
++/// data type unsigned int, data length 4 byte
++typedef unsigned int MI_U32; // 4 bytes
++/// data type unsigned int, data length 8 byte
++typedef unsigned long long MI_U64; // 8 bytes
++/// data type signed char, data length 1 byte
++typedef signed char MI_S8; // 1 byte
++/// data type signed short, data length 2 byte
++typedef signed short MI_S16; // 2 bytes
++/// data type signed int, data length 4 byte
++typedef signed int MI_S32; // 4 bytes
++/// data type signed int, data length 8 byte
++typedef signed long long MI_S64; // 8 bytes
++/// data type float, data length 4 byte
++typedef float MI_FLOAT; // 4 bytes
++/// data type 64bit physical address
++typedef unsigned long long MI_PHY; // 8 bytes
++/// data type pointer content
++typedef unsigned long MI_VIRT; // 4 bytes when 32bit toolchain, 8 bytes when 64bit toolchain.
++
++typedef unsigned char MI_BOOL;
++
++typedef struct
++{
++    size_t len;
++    void *pVa;
++    MI_PHY phy;
++}st_MI_ADDR;
++
++typedef enum
++{
++    E_MI_GFX_FMT_I1 = 0, /* MS_ColorFormat */
++    E_MI_GFX_FMT_I2,
++    E_MI_GFX_FMT_I4,
++    E_MI_GFX_FMT_I8,
++    E_MI_GFX_FMT_FABAFGBG2266,
++    E_MI_GFX_FMT_1ABFGBG12355,
++    E_MI_GFX_FMT_RGB565,
++    E_MI_GFX_FMT_ARGB1555,
++    E_MI_GFX_FMT_ARGB4444,
++    E_MI_GFX_FMT_ARGB1555_DST,
++    E_MI_GFX_FMT_YUV422,
++    E_MI_GFX_FMT_ARGB8888,
++    E_MI_GFX_FMT_RGBA5551,
++    E_MI_GFX_FMT_RGBA4444,
++    E_MI_GFX_FMT_ABGR8888,
++    E_MI_GFX_FMT_BGRA5551,
++    E_MI_GFX_FMT_ABGR1555,
++    E_MI_GFX_FMT_ABGR4444,
++    E_MI_GFX_FMT_BGRA4444,
++    E_MI_GFX_FMT_BGR565,
++    E_MI_GFX_FMT_RGBA8888,
++    E_MI_GFX_FMT_BGRA8888,
++    E_MI_GFX_FMT_MAX
++} MI_GFX_ColorFmt_e;
++
++typedef enum
++{
++    E_MI_GFX_RGB_OP_EQUAL = 0,
++    E_MI_GFX_RGB_OP_NOT_EQUAL,
++    E_MI_GFX_ALPHA_OP_EQUAL,
++    E_MI_GFX_ALPHA_OP_NOT_EQUAL,
++    E_MI_GFX_ARGB_OP_EQUAL,
++    E_MI_GFX_ARGB_OP_NOT_EQUAL,
++    E_MI_GFX_CKEY_OP_MAX,
++} MI_GFX_ColorKeyOp_e;
++
++typedef enum
++{
++    E_MI_GFX_DFB_BLD_ZERO = 0,
++    E_MI_GFX_DFB_BLD_ONE,
++    E_MI_GFX_DFB_BLD_SRCCOLOR,
++    E_MI_GFX_DFB_BLD_INVSRCCOLOR,
++    E_MI_GFX_DFB_BLD_SRCALPHA,
++    E_MI_GFX_DFB_BLD_INVSRCALPHA,
++    E_MI_GFX_DFB_BLD_DESTALPHA,
++    E_MI_GFX_DFB_BLD_INVDESTALPHA,
++    E_MI_GFX_DFB_BLD_DESTCOLOR,
++    E_MI_GFX_DFB_BLD_INVDESTCOLOR,
++    E_MI_GFX_DFB_BLD_SRCALPHASAT,
++    E_MI_GFX_DFB_BLD_MAX,
++} MI_GFX_DfbBldOp_e;
++
++typedef enum
++{
++    E_MI_GFX_MIRROR_NONE = 0,
++    E_MI_GFX_MIRROR_HORIZONTAL,
++    E_MI_GFX_MIRROR_VERTICAL,
++    E_MI_GFX_MIRROR_BOTH,
++    E_MI_GFX_MIRROR_MAX
++} MI_GFX_Mirror_e;
++
++typedef enum
++{
++    E_MI_GFX_ROTATE_0 = 0,
++    E_MI_GFX_ROTATE_90,
++    E_MI_GFX_ROTATE_180,
++    E_MI_GFX_ROTATE_270,
++    E_MI_GFX_ROTATE_MAX
++} MI_GFX_Rotate_e;
++
++#define MI_GFX_INITIAL_ERROR_CODE (0x220)
++typedef enum
++{
++    E_MI_GFX_ERR_NOT_INIT = MI_GFX_INITIAL_ERROR_CODE,
++    E_MI_GFX_ERR_GFX_DRV_NOT_SUPPORT,
++    E_MI_GFX_ERR_GFX_DRV_FAIL_FORMAT,
++    E_MI_GFX_ERR_GFX_NON_ALIGN_ADDRESS,
++    E_MI_GFX_ERR_GFX_NON_ALIGN_PITCH,
++    E_MI_GFX_ERR_GFX_DRV_FAIL_OVERLAP,
++    E_MI_GFX_ERR_GFX_DRV_FAIL_STRETCH,
++    E_MI_GFX_ERR_GFX_DRV_FAIL_ITALIC,
++    E_MI_GFX_ERR_GFX_DRV_FAIL_LOCKED,
++    E_MI_GFX_ERR_GFX_DRV_FAIL_BLTADDR,
++    E_MI_GFX_ERR_MAX
++} MI_GFX_ErrCode_e;
++
++//=============================================================================
++// GFX point
++//=============================================================================
++typedef struct MI_GFX_Point_s
++{
++    /// x coordinate
++    MI_S16 s16x;
++    /// y coordinate
++    MI_S16 s16y;
++} MI_GFX_Point_t;
++
++typedef struct MI_GFX_Rect_s
++{
++    MI_S32 s32Xpos;
++    MI_S32 s32Ypos;
++    MI_U32 u32Width;
++    MI_U32 u32Height;
++} MI_GFX_Rect_t;
++
++//=============================================================================
++// GFX line pattern infomation struct
++//=============================================================================
++typedef struct MI_GFX_Line_s
++{
++    /// start point of line
++    MI_GFX_Point_t stPointFrom;
++    /// end point of line
++    MI_GFX_Point_t stPointTo;
++    /// line width in pixel
++    MI_U16 u16Width;
++    /// Constant color or  Gradient color
++    MI_BOOL bColorGradient;
++    /// color range from start to end
++    MI_U32 u32ColorFrom;
++    ///
++    MI_U32 u32ColorTo;
++} MI_GFX_Line_t;
++
++//=============================================================================
++// GFX palette information
++//=============================================================================
++typedef union
++{
++    /// ARGB8888 byte order
++    struct
++    {
++        MI_U8 u8A;
++        MI_U8 u8R;
++        MI_U8 u8G;
++        MI_U8 u8B;
++    } RGB;
++    // u8Data[0] = u8A
++    // u8Data[1] = u8R
++    // u8Data[2] = u8G
++    // u8Data[3] = u8B
++    MI_U8 u8Data[4];
++} MI_GFX_PaletteEntry_t;
++
++typedef struct MI_GFX_Palette_s
++{
++    /// array subscripts are indentical to value of Index Color
++    MI_GFX_PaletteEntry_t aunPalette[256];
++    /// Starting Index in palette to config
++    MI_U16 u16PalStart;
++    /// Ending Index in palette to config
++    MI_U16 u16PalEnd;
++}MI_GFX_Palette_t;
++
++typedef struct MI_GFX_ColorKey_s
++{
++    MI_U32 u32ColorStart;
++    MI_U32 u32ColorEnd;
++} MI_GFX_ColorKeyValue_t;
++
++typedef struct MI_GFX_ColorKeyInfo_s
++{
++    MI_BOOL bEnColorKey;
++    MI_GFX_ColorKeyOp_e eCKeyOp;
++    MI_GFX_ColorFmt_e eCKeyFmt;
++    MI_GFX_ColorKeyValue_t stCKeyVal;
++} MI_GFX_ColorKeyInfo_t;
++
++typedef struct MI_GFX_Surface_s
++{
++    MI_PHY phyAddr;
++    MI_GFX_ColorFmt_e eColorFmt;
++    MI_U32 u32Width;
++    MI_U32 u32Height;
++    MI_U32 u32Stride;
++} MI_GFX_Surface_t;
++
++typedef enum
++{
++    E_MI_GFX_DFB_BLEND_NOFX = 0x00000000,
++    E_MI_GFX_DFB_BLEND_COLORALPHA = 0x00000001,
++    E_MI_GFX_DFB_BLEND_ALPHACHANNEL = 0x00000002,
++    E_MI_GFX_DFB_BLEND_COLORIZE = 0x00000004,
++    E_MI_GFX_DFB_BLEND_SRC_PREMULTIPLY = 0x00000008,
++    E_MI_GFX_DFB_BLEND_SRC_PREMULTCOLOR = 0x00000010,
++    E_MI_GFX_DFB_BLEND_DST_PREMULTIPLY = 0x00000020,
++    E_MI_GFX_DFB_BLEND_XOR = 0x00000040,
++    E_MI_GFX_DFB_BLEND_DEMULTIPLY = 0x00000080,
++    E_MI_GFX_DFB_BLEND_SRC_COLORKEY = 0x00000100,
++    E_MI_GFX_DFB_BLEND_DST_COLORKEY = 0x00000200,
++    E_MI_GFX_DFB_BLEND_MAX = 0x3FF
++} MI_Gfx_DfbBlendFlags_e;
++
++typedef struct MI_GFX_Opt_s
++{
++    MI_GFX_Rect_t stClipRect;
++    MI_GFX_ColorKeyInfo_t stSrcColorKeyInfo;
++    MI_GFX_ColorKeyInfo_t stDstColorKeyInfo;
++    MI_GFX_DfbBldOp_e eSrcDfbBldOp;
++    MI_GFX_DfbBldOp_e eDstDfbBldOp;
++    MI_GFX_Mirror_e eMirror;
++    MI_GFX_Rotate_e eRotate;
++    MI_Gfx_DfbBlendFlags_e eDFBBlendFlag;
++    MI_U32 u32GlobalSrcConstColor;
++    MI_U32 u32GlobalDstConstColor;
++} MI_GFX_Opt_t;
++
++typedef struct MI_GFX_DevAttr_s
++{
++    MI_U32 u32DevId;
++    MI_U8 *u8Data;
++} MI_GFX_DevAttr_t;
++
++typedef MI_S32 MI_GFX_DEV;
++
++#define RECTW(r) (r.right-r.left)
++#define RECTH(r) (r.bottom-r.top)
++
++typedef struct RECT
++{
++    int top;
++    int bottom;
++    int left;
++    int right;
++} RECT;
++
++typedef struct Rect
++{
++    int x;
++    int y;
++    int w;
++    int h;
++} Rect;
++
++typedef struct Surface
++{
++    int w;
++    int h;
++    int pitch;
++    int BytesPerPixel;
++    MI_GFX_ColorFmt_e eGFXcolorFmt;
++    unsigned long long phy_addr;
++} Surface;
++
++MI_S32 SS_MI_Init(void);
++
++MI_S32 SS_MI_Exit(void);
++
++void SS_SYS_MemcpyPa(MI_PHY phyDst, MI_PHY phySrc, MI_U32 u32Lenth);
++
++void *SS_SYS_GetMIAddr(size_t size, st_MI_ADDR *miAddr);
++
++void SS_SYS_FreeMIAddr(st_MI_ADDR *miAddr);
++
++MI_S32 SS_GFX_BitBlit(MI_GFX_Surface_t *pstSrc, MI_GFX_Rect_t *pstSrcRect,
++                            MI_GFX_Surface_t *pstDst, MI_GFX_Rect_t *pstDstRect,
++                            MI_GFX_Opt_t *pstOpt, MI_U16 *pu16Fence);
++
++MI_S32 SS_GFX_WaitAllDone(MI_BOOL bWaitAllDone, MI_U16 u16TargetFence);
++
++void SS_GFX_BitBlit_CCW(Surface * pSrcSurface, Surface *pDstSurface, RECT* pRect);
++
++void SS_GFX_BitBlit_CW(Surface * pSrcSurface, Surface *pDstSurface, RECT* pRect);
++
++void SS_GFX_BitBlit_HVFlip(Surface * pSrcSurface, Surface *pDstSurface, RECT* pRect);
++
++void SS_GFX_BitBlit_Normal(Surface * pSrcSurface, Surface *pDstSurface, RECT* pRect);
++
++#ifdef __cplusplus
++} /* extern "C" */
++#endif
++
++#endif // __SSGFX_H__
