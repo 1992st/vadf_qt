@@ -6,9 +6,9 @@
 - How to build
 
 ## Qt source and Lisence
- Download qt src code from : http://download.qt.io/
- Lisence: LGPL_v3　and other licenses that Qt need to comply with
- reference: https://github.com/aaron201912/Qt5.15_example/blob/master/README.md
+- Download qt src code from : http://download.qt.io/
+- Lisence: LGPL_v3　and other licenses that Qt need to comply with
+- reference: https://github.com/aaron201912/Qt5.15_example/blob/master/README.md
 ## How to buile
 - Qt 5交叉编译
   - 设置环境变量
