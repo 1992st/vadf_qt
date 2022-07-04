@@ -2,8 +2,8 @@
  This project is use to make qt5 to embedded platftom(ssd202) and fix some qt question
 
 ## catalog
- Qt source and Lisence
- How to build
+- Qt source and Lisence
+- How to build
 
 ## Qt source and Lisence
  Download qt src code from : http://download.qt.io/
